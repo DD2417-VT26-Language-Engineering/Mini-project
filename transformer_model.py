@@ -1,5 +1,8 @@
 import os
 import json
+import argparse
+from collections import Counter
+from pathlib import Path
 
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
@@ -11,6 +14,9 @@ from torch import nn
 from torch.optim import Adam
 import torch
 from self_attention import MultiHeadSelfAttention
+
+TRAINING_TEXT_FILE = Path("data/sentences.txt")
+CONTRACTION_SUFFIXES = {"d", "ll", "m", "re", "s", "t", "ve"}
 
 
 class TextDataset(Dataset):
@@ -128,6 +134,53 @@ def tokenize_and_save(tokenizer, filename, save_filename):
 
     return token_ids
 
+
+def load_word_vocabulary(filename=TRAINING_TEXT_FILE):
+    counts = Counter()
+
+    with open(filename, "r", encoding="utf-8") as f:
+        for line in f:
+            counts.update(line.strip().split())
+
+    return [
+        word
+        for word, _ in counts.most_common()
+        if is_valid_suggestion_word(word)
+    ]
+
+
+def is_valid_suggestion_word(word):
+    if len(word) == 1 and word not in {"a", "i"}:
+        return False
+
+    return word not in CONTRACTION_SUFFIXES
+
+
+def encoded_word_candidates(tokenizer, word_vocabulary, prefix=""):
+    seen = set()
+
+    for word in word_vocabulary:
+        if word in seen or not word.startswith(prefix):
+            continue
+
+        token_ids = tokenizer.encode(word).ids
+        if not token_ids:
+            continue
+
+        seen.add(word)
+        yield word, token_ids
+
+
+def get_model_device(model, device=None):
+    if device is not None:
+        return device
+
+    try:
+        return next(model.parameters()).device
+    except (AttributeError, StopIteration):
+        return torch.device("cpu")
+
+
 def evaluate(model, dataloader, criterion, device):
     model.eval()
     total_loss = 0
@@ -233,46 +286,132 @@ def create_and_train(config=Config(), device=None, tokenizer=None):
     # save the model
     torch.save(model.state_dict(), "word_predictor_model.pth")
 
-def predict_next_word(model, tokenizer, prompt, prefix, context_len=128, top_k = 100, device=None):
+def predict_next_word(
+    model,
+    tokenizer,
+    prompt,
+    prefix,
+    context_len=128,
+    top_k=100,
+    device=None,
+    word_vocabulary=None,
+    candidate_pool_size=500,
+):
     model.eval()
+
+    prompt = prompt.lower()
+    prefix = prefix.lower()
+
+    if word_vocabulary is None:
+        word_vocabulary = load_word_vocabulary()
+
+    candidates = list(encoded_word_candidates(tokenizer, word_vocabulary, prefix))
+    if not candidates:
+        return []
+
+    device = get_model_device(model, device)
+
     with torch.no_grad():
         encoded = tokenizer.encode(prompt)
         token_ids = encoded.ids[-context_len:]  # take last context_len tokens
+
+        if not token_ids:
+            return [word for word, _ in candidates[:top_k]]
+
         x = torch.tensor(token_ids).unsqueeze(0).to(device)  # shape (1, context_len)
         
         logits = model(x)  # shape (1, context_len, vocab_size)
         last_logits = logits[0, -1]  # shape (vocab_size,)
-        top_k_indices = torch.topk(last_logits, top_k).indices.cpu().numpy()
-        predicted_words = [tokenizer.decode([idx]) for idx in top_k_indices]
-        predicted_words = [w for w in predicted_words if w.startswith(prefix)]
+        first_log_probs = torch.log_softmax(last_logits, dim=-1)
 
-        return predicted_words
+        first_token_scores = [
+            (first_log_probs[ids[0]].item(), word, ids)
+            for word, ids in candidates
+        ]
+        first_token_scores.sort(key=lambda item: item[0], reverse=True)
+
+        if candidate_pool_size is not None:
+            pool_size = max(candidate_pool_size, top_k)
+            first_token_scores = first_token_scores[:pool_size]
+
+        predicted_words = []
+        for first_score, word, candidate_ids in first_token_scores:
+            score = first_score
+            current_context = list(token_ids)
+
+            for next_pos, previous_candidate_id in enumerate(candidate_ids[:-1], start=1):
+                current_context.append(previous_candidate_id)
+                x = torch.tensor(current_context[-context_len:]).unsqueeze(0).to(device)
+                logits = model(x)
+                log_probs = torch.log_softmax(logits[0, -1], dim=-1)
+                score += log_probs[candidate_ids[next_pos]].item()
+
+            predicted_words.append((score, word))
+
+        predicted_words.sort(key=lambda item: item[0], reverse=True)
+        return [word for _, word in predicted_words[:top_k]]
     
 
-def test_model(config, device, tokenizer):
+def test_model(config, device, tokenizer, checkpoint_file="word_predictor_model.pth", top_k=10):
     model = TinyStoriesLM(config)
-    model.load_state_dict(torch.load("word_predictor_model.pth", map_location=device))
+    model.load_state_dict(torch.load(checkpoint_file, map_location=device))
     model.to(device)
+    word_vocabulary = load_word_vocabulary()
+    print(f"Loaded checkpoint: {checkpoint_file}")
     
     while True:
-        prompt = input("> ")
+        try:
+            prompt = input("> ")
+        except EOFError:
+            print()
+            break
+
         prefix = ""
-        if not prompt.endswith(" "):
-            prefix = prompt.strip().split()[-1]
+        words = prompt.strip().split()
+        if words and not prompt.endswith(" "):
+            prefix = words[-1]
             prompt = prompt[:-len(prefix)]
 
 
         print(f"Prompt: [{prompt}], Prefix: [{prefix}]")
 
-        predictions = predict_next_word(model, tokenizer, prompt, prefix, context_len=config.block_size, device=device)
+        predictions = predict_next_word(
+            model,
+            tokenizer,
+            prompt,
+            prefix,
+            context_len=config.block_size,
+            top_k=top_k,
+            device=device,
+            word_vocabulary=word_vocabulary,
+        )
         print( predictions)
 
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--predict",
+        metavar="CHECKPOINT",
+        help="Load a saved .pth checkpoint and start the predictor without training.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="Number of word suggestions to print in prediction mode.",
+    )
+    args = parser.parse_args()
+
     tokenizer = get_tokenizer()
     config = Config()
     device = torch.device("mps" if torch.mps.is_available() else "cpu")
+
+    if args.predict:
+        test_model(config, device, tokenizer, checkpoint_file=args.predict, top_k=args.top_k)
+        return
+
     create_and_train(config, device, tokenizer)
 
     test_model(config, device, tokenizer)

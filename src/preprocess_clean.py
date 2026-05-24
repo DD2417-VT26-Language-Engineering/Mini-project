@@ -7,7 +7,7 @@ OUTPUT_FILE = Path("data/processed/sentences.txt")
 text = INPUT_FILE.read_text(encoding="utf-8").lower()
 
 # Normalize unicode apostrophes
-text = text.replace("’", "'")
+text = text.replace("’", "'").replace("‘", "'").replace("`", "'")
 
 # Fix spaced contractions
 text = re.sub(r"\b([a-z]+)\s+'\s+([a-z]+)\b", r"\1'\2", text)
